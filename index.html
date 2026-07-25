@@ -847,6 +847,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
       <p>Drag and drop Jenny’s Excel file here<br>or click to select it</p>
       <div class="upload-btn">Choose Excel file</div>
       <p style="margin-top:10px;font-size:11px;color:var(--text-3);">Supports Jenny’s current Excel columns — no template required</p>
+      <div id="supabase-connection" style="margin-top:14px;font-size:12px"></div>
     </div>
     <input type="file" id="file-input" accept=".xlsx,.xls" style="display:none" onchange="handleFile(this.files[0])">
   </div>
@@ -1780,27 +1781,152 @@ function showImportReview(){
 }
 function closeImportReview(){document.getElementById('import-review-modal').classList.remove('on')}
 function escapeHtml(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]))}
-function confirmImport(){
-  const p=pendingImport;if(!p)return;
-  const valid=p.rows.filter(x=>x.level!=='error');
-  const byPhone=new Map(prospects.filter(x=>x.tel).map(x=>[normalizePhone(x.tel),x]));
-  const byEmail=new Map(prospects.filter(x=>x.email).map(x=>[norm(x.email).toLowerCase(),x]));
-  valid.forEach(item=>{
-    const old=(item.tel&&byPhone.get(normalizePhone(item.tel)))||(item.email&&byEmail.get(item.email));
-    if(old){Object.assign(old,{...item,id:old.id});}
-    else prospects.push(item);
-    if(item.response||item.followupResponse){
-      const id=old?old.id:item.id;if(!prospectHist[id])prospectHist[id]=[];
-      if(item.response)prospectHist[id].push({date:'Imported',statut:'Previous response',note:item.response});
-      if(item.followupResponse)prospectHist[id].push({date:'Imported',statut:'Previous follow-up',note:item.followupResponse});
-      prospectStatuts[id]='In progress';
+// ═══════════════════════════════════════════
+// SUPABASE CONNECTION + EXCEL IMPORT SYNC
+// ═══════════════════════════════════════════
+const SUPABASE_CONFIG={
+  url:'https://opnzhbojhromhlgotjjf.supabase.co',
+  anonKey:'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9wbnpoYm9qaHJvbWhsZ290ampmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYwMTgwOTUsImV4cCI6MjA5MTU5NDA5NX0.JNbKaCFtpXpZ7eoBAuhOp-CwvTr8_7qErUq4trfJ1GU'
+};
+
+function getSupabaseConfig(){
+  return SUPABASE_CONFIG;
+}
+
+function configureSupabase(){
+  return SUPABASE_CONFIG;
+}
+
+function updateSupabaseConnectionBadge(){
+  const el=document.getElementById('supabase-connection');
+  if(!el)return;
+  el.innerHTML='<span style="color:var(--green-d);font-weight:700">● Supabase connected automatically</span><span style="color:var(--muted);margin-left:8px">Imports are saved directly to the CRM database.</span>';
+}
+
+async function supabaseRequest(path,options={}){
+  const config=getSupabaseConfig()||configureSupabase();
+  if(!config)throw new Error('Supabase connection was not configured.');
+  const response=await fetch(config.url+'/rest/v1/'+path,{
+    ...options,
+    headers:{
+      'apikey':config.anonKey,
+      'Authorization':'Bearer '+config.anonKey,
+      'Content-Type':'application/json',
+      ...(options.headers||{})
     }
   });
+  const text=await response.text();
+  let data=null;
+  try{data=text?JSON.parse(text):null}catch(e){data=text}
+  if(!response.ok){
+    const message=data?.message||data?.hint||data?.details||text||('HTTP '+response.status);
+    throw new Error(message);
+  }
+  return data;
+}
+
+async function findSupabaseProspect(item){
+  if(item.email){
+    const rows=await supabaseRequest('prospects?select=id,email,telephone&email=eq.'+encodeURIComponent(item.email)+'&limit=1');
+    if(Array.isArray(rows)&&rows.length)return rows[0];
+  }
+  if(item.tel){
+    const rows=await supabaseRequest('prospects?select=id,email,telephone&telephone=eq.'+encodeURIComponent(item.tel)+'&limit=1');
+    if(Array.isArray(rows)&&rows.length)return rows[0];
+  }
+  return null;
+}
+
+function prospectToSupabasePayload(item){
+  return {
+    nom:item.name||'',
+    prenom:item.firstName||'',
+    nom_contact:item.lastName||'',
+    email:item.email||null,
+    email_status:item.emailStatus||null,
+    telephone:item.tel||null,
+    linkedin:item.linkedin||null,
+    website:item.website||null,
+    ville:item.ville||null,
+    region:item.state||null,
+    pays:item.country||null,
+    response:item.response||null,
+    followup_response:item.followupResponse||null,
+    source:item.source||'Excel import',
+    stade:(item.response||item.followupResponse)?'In progress':'To call',
+    updated_at:new Date().toISOString()
+  };
+}
+
+async function saveProspectToSupabase(item){
+  const existing=await findSupabaseProspect(item);
+  const payload=prospectToSupabasePayload(item);
+  if(existing?.id){
+    const rows=await supabaseRequest('prospects?id=eq.'+encodeURIComponent(existing.id),{
+      method:'PATCH',
+      headers:{'Prefer':'return=representation'},
+      body:JSON.stringify(payload)
+    });
+    return {record:Array.isArray(rows)?rows[0]:rows,action:'updated'};
+  }
+  const rows=await supabaseRequest('prospects',{
+    method:'POST',
+    headers:{'Prefer':'return=representation'},
+    body:JSON.stringify(payload)
+  });
+  return {record:Array.isArray(rows)?rows[0]:rows,action:'created'};
+}
+
+async function confirmImport(){
+  const p=pendingImport;if(!p)return;
+  const valid=p.rows.filter(x=>x.level!=='error');
+  if(!valid.length){toast('There are no valid rows to import.');return}
+
+  const btn=document.getElementById('confirm-import-btn');
+  const originalText=btn.textContent;
+  btn.disabled=true;btn.textContent='Importing to Supabase…';
+
+  const byPhone=new Map(prospects.filter(x=>x.tel).map(x=>[normalizePhone(x.tel),x]));
+  const byEmail=new Map(prospects.filter(x=>x.email).map(x=>[norm(x.email).toLowerCase(),x]));
+  let created=0,updated=0,failed=0;
+  const failures=[];
+
+  for(const item of valid){
+    try{
+      const result=await saveProspectToSupabase(item);
+      if(result.action==='created')created++;else updated++;
+      const old=(item.tel&&byPhone.get(normalizePhone(item.tel)))||(item.email&&byEmail.get(item.email));
+      const savedId=result.record?.id||old?.id||item.id;
+      const savedItem={...item,id:savedId};
+      if(old)Object.assign(old,savedItem);else prospects.push(savedItem);
+      if(savedItem.response||savedItem.followupResponse){
+        if(!prospectHist[savedId])prospectHist[savedId]=[];
+        if(savedItem.response)prospectHist[savedId].push({date:'Imported',statut:'Previous response',note:savedItem.response});
+        if(savedItem.followupResponse)prospectHist[savedId].push({date:'Imported',statut:'Previous follow-up',note:savedItem.followupResponse});
+        prospectStatuts[savedId]='In progress';
+      }
+    }catch(err){
+      failed++;
+      failures.push({row:item.rowNumber,company:item.name,error:err.message});
+      console.error('Supabase import failed',item,err);
+    }
+  }
+
   localStorage.setItem('butly_prospects',JSON.stringify(prospects));
   localStorage.setItem('butly_p_filename',p.filename);
   localStorage.setItem('butly_p_date',new Date().toLocaleDateString('en-GB'));
-  saveProspectData();closeImportReview();showProspects(p.filename);updateNextProspect();
-  toast(`${valid.length} rows imported · ${p.counts.error} blocked`);
+  saveProspectData();
+  btn.disabled=false;btn.textContent=originalText;
+
+  if(failed){
+    pendingImport.issues.push(...failures.map(x=>({row:x.row,company:x.company,level:'error',issue:'Supabase: '+x.error})));
+    showImportReview();
+    toast(`${created} created · ${updated} updated · ${failed} failed`);
+    return;
+  }
+
+  closeImportReview();showProspects(p.filename);updateNextProspect();
+  toast(`${created} created · ${updated} updated in Supabase · ${p.counts.error} blocked`);
   pendingImport=null;
 }
 function downloadImportErrors(){
@@ -2069,6 +2195,7 @@ showScript(0,document.querySelector('.s-tab'));
 setMode('lecture');
 showPep();
 if(prospects.length){showProspects(localStorage.getItem('butly_p_filename')||'Saved prospect list');}
+updateSupabaseConnectionBadge();
 renderCalls();
 renderKanban();
 renderRelances();
